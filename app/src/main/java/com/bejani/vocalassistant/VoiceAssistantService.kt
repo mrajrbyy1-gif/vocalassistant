@@ -128,36 +128,13 @@ class VoiceAssistantService : Service() {
             .replace("‌", " ")
             .replace(Regex("\\s+"), " ")
             .trim()
-
-        // ===== ساعت و تاریخ =====
-        if (isTimeQuery(normalizedCommand)) {
-            confirmationMode = false
-            awaitingCommand = false
-            val time = getCurrentTime()
-            val prompt = "ساعت $time است"
-            updateNotification(prompt)
-            speak(prompt)
+        // Information commands: time, date and battery.
+        // These are handled before the call parser so commands such as
+        // "شارژ باتری چقدره" never fall through to the generic response.
+        if (!confirmationMode && handleInfoCommand(normalizedCommand)) {
+            awaitingCommand = true
             return
         }
-        if (isDateQuery(normalizedCommand)) {
-            confirmationMode = false
-            awaitingCommand = false
-            val date = getCurrentDate()
-            val prompt = "امروز $date است"
-            updateNotification(prompt)
-            speak(prompt)
-            return
-        }
-        if (isDayQuery(normalizedCommand)) {
-            confirmationMode = false
-            awaitingCommand = false
-            val day = getCurrentDay()
-            val prompt = "امروز $day است"
-            updateNotification(prompt)
-            speak(prompt)
-            return
-        }
-        // ===== پایان ساعت و تاریخ =====
 
         // A clear call command must be accepted even if a recognizer restart
         // accidentally reset the conversational state after the wake word.
@@ -201,55 +178,154 @@ class VoiceAssistantService : Service() {
         }
     }
 
-    private fun isCallCommand(text: String): Boolean = listOf(
-        "تماس", "تماس بگیر", "تماس بزن", "زنگ", "زنگ بزن", "زنگ بگیر", "تلفن"
-    ).any(text::contains)
+    /**
+     * Handles simple device-information questions without internet or AI.
+     * The values come directly from the phone at the moment of the question.
+     */
+    private fun handleInfoCommand(text: String): Boolean {
+        val command = normalizeCommandForMatching(text)
 
-    // ===== توابع ساعت و تاریخ =====
-    private fun isTimeQuery(text: String): Boolean = listOf(
-        "ساعت", "چند ساعت", "ساعت چنده", "ساعت چند"
-    ).any(text::contains)
+        val asksTime = listOf(
+            "ساعت چنده", "ساعت چند است", "ساعت چند", "الان ساعت چنده",
+            "زمان چنده", "زمان چند است", "وقت چنده", "وقت چند است"
+        ).any { command.contains(it) } || command == "ساعت"
 
-    private fun isDateQuery(text: String): Boolean = listOf(
-        "تاریخ", "امروز چندم", "چندمه", "تاریخ امروز"
-    ).any(text::contains)
+        val asksDate = listOf(
+            "تاریخ چنده", "تاریخ چند است", "تاریخ امروز", "امروز چندمه",
+            "امروز چندم است", "امروز چه روزیه", "امروز چه روزی است",
+            "امروز چه روزی هست", "امروز چه روزیه"
+        ).any { command.contains(it) }
 
-    private fun isDayQuery(text: String): Boolean = listOf(
-        "چه روزی", "چی روزی", "روز چیه", "امروز چه روز"
-    ).any(text::contains)
+        val asksBattery = listOf(
+            "شارژ باتری", "باتری چقدره", "باتری چند درصده", "باتری چند درصد است",
+            "درصد باتری", "شارژم چقدره", "شارژ گوشی", "باتری گوشی"
+        ).any { command.contains(it) }
 
-    private fun getCurrentTime(): String {
-        val calendar = java.util.Calendar.getInstance()
-        val hour = calendar.get(java.util.Calendar.HOUR_OF_DAY)
-        val minute = calendar.get(java.util.Calendar.MINUTE)
-        return "$hour و $minute دقیقه"
+        return when {
+            asksTime -> {
+                speakCurrentTime()
+                true
+            }
+            asksDate -> {
+                speakCurrentDate()
+                true
+            }
+            asksBattery -> {
+                speakBatteryLevel()
+                true
+            }
+            else -> false
+        }
     }
 
-    private fun getCurrentDate(): String {
-        val calendar = java.util.Calendar.getInstance()
-        val year = calendar.get(java.util.Calendar.YEAR)
-        val month = calendar.get(java.util.Calendar.MONTH) + 1
-        val day = calendar.get(java.util.Calendar.DAY_OF_MONTH)
+    private fun normalizeCommandForMatching(value: String): String = value
+        .replace("ي", "ی")
+        .replace("ك", "ک")
+        .replace("ۀ", "ه")
+        .replace("ة", "ه")
+        .replace("‌", " ")
+        .replace("؟", " ")
+        .replace("?", " ")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+        .lowercase(Locale("fa", "IR"))
 
-        // تبدیل ساده به تاریخ شمسی (تقریبی)
-        val persianMonths = listOf(
+    private fun speakCurrentTime() {
+        val now = java.time.LocalTime.now()
+        val answer = "الان ساعت ${toPersianDigits(String.format(Locale.US, "%02d:%02d", now.hour, now.minute))} است."
+        updateNotification(answer)
+        speak(answer)
+    }
+
+    private fun speakCurrentDate() {
+        val today = java.time.LocalDate.now()
+        val jalali = gregorianToJalali(today.year, today.monthValue, today.dayOfMonth)
+        val weekdays = arrayOf(
+            "دوشنبه", "سه‌شنبه", "چهارشنبه", "پنجشنبه", "جمعه", "شنبه", "یکشنبه"
+        )
+        val months = arrayOf(
             "فروردین", "اردیبهشت", "خرداد", "تیر", "مرداد", "شهریور",
             "مهر", "آبان", "آذر", "دی", "بهمن", "اسفند"
         )
-        val monthName = persianMonths.getOrElse(month - 1) { "ماه $month" }
-        return "$day $monthName $year"
+        val weekday = weekdays[today.dayOfWeek.value - 1]
+        val answer = "امروز $weekday، ${toPersianDigits(jalali.third.toString())} ${months[jalali.second - 1]} ${toPersianDigits(jalali.first.toString())} است."
+        updateNotification(answer)
+        speak(answer)
     }
 
-    private fun getCurrentDay(): String {
-        val calendar = java.util.Calendar.getInstance()
-        val dayOfWeek = calendar.get(java.util.Calendar.DAY_OF_WEEK)
-        val days = listOf(
-            "یکشنبه", "دوشنبه", "سه‌شنبه", "چهارشنبه",
-            "پنجشنبه", "جمعه", "شنبه"
-        )
-        return days.getOrElse(dayOfWeek - 1) { "روز ناشناخته" }
+    private fun speakBatteryLevel() {
+        val batteryIntent = registerReceiver(null, android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        if (batteryIntent == null) {
+            val answer = "نتوانستم میزان شارژ باتری را بخوانم."
+            updateNotification(answer)
+            speak(answer)
+            return
+        }
+
+        val level = batteryIntent.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1)
+        val scale = batteryIntent.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, -1)
+        val status = batteryIntent.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1)
+        val percent = if (level >= 0 && scale > 0) (level * 100 / scale) else -1
+
+        val chargingText = when (status) {
+            android.os.BatteryManager.BATTERY_STATUS_CHARGING -> " و در حال شارژ است"
+            android.os.BatteryManager.BATTERY_STATUS_FULL -> " و کاملاً شارژ شده است"
+            else -> ""
+        }
+
+        val answer = if (percent >= 0) {
+            "شارژ باتری ${toPersianDigits(percent.toString())} درصد است$chargingText."
+        } else {
+            "نتوانستم میزان شارژ باتری را بخوانم."
+        }
+        updateNotification(answer)
+        speak(answer)
     }
-    // ===== پایان توابع ساعت و تاریخ =====
+
+    private fun toPersianDigits(value: String): String = value.map { ch ->
+        when (ch) {
+            '0' -> '۰'; '1' -> '۱'; '2' -> '۲'; '3' -> '۳'; '4' -> '۴'
+            '5' -> '۵'; '6' -> '۶'; '7' -> '۷'; '8' -> '۸'; '9' -> '۹'
+            else -> ch
+        }
+    }.joinToString("")
+
+    /** Gregorian date -> Persian (Jalali) date. */
+    private fun gregorianToJalali(gyInput: Int, gm: Int, gd: Int): Triple<Int, Int, Int> {
+        val gdm = intArrayOf(0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
+        var gy = gyInput
+        var jy = if (gy > 1600) 979 else 0
+        if (gy > 1600) gy -= 1600 else gy -= 621
+
+        val gy2 = if (gm > 2) gy + 1 else gy
+        var days = 365 * gy + (gy2 + 3) / 4 - (gy2 + 99) / 100 +
+            (gy2 + 399) / 400 - 80 + gd + gdm[gm - 1]
+
+        jy += 33 * (days / 12053)
+        days %= 12053
+        jy += 4 * (days / 1461)
+        days %= 1461
+
+        if (days > 365) {
+            jy += (days - 1) / 365
+            days = (days - 1) % 365
+        }
+
+        val jm: Int
+        val jd: Int
+        if (days < 186) {
+            jm = 1 + days / 31
+            jd = 1 + days % 31
+        } else {
+            jm = 7 + (days - 186) / 30
+            jd = 1 + (days - 186) % 30
+        }
+        return Triple(jy, jm, jd)
+    }
+
+    private fun isCallCommand(text: String): Boolean = listOf(
+        "تماس", "تماس بگیر", "تماس بزن", "زنگ", "زنگ بزن", "زنگ بگیر", "تلفن"
+    ).any(text::contains)
 
     private fun findContact(command: String): Pair<String, String>? {
         val query = command
