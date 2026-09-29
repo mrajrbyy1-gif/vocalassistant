@@ -24,164 +24,185 @@ class OfflinePersianTts(private val context: Context) {
     }
 
     private val modelDir = File(context.filesDir, "tts/fas")
-    private var engine: OfflineTts? = null
-    private var track: AudioTrack? = null
+    @Volatile private var engine: OfflineTts? = null
+    @Volatile private var track: AudioTrack? = null
+    @Volatile private var preparing = false
 
-    fun isInstalled(): Boolean = File(modelDir, "model.onnx").length() > 1_000_000 &&
-        File(modelDir, "tokens.txt").length() > 10
+    fun isInstalled(): Boolean {
+        return try {
+            File(modelDir, "model.onnx").length() > 1_000_000 &&
+                File(modelDir, "tokens.txt").length() > 10
+        } catch (_: Exception) { false }
+    }
 
     /** Downloads the model once and initializes the native engine. Call off the main thread. */
     @Synchronized
     fun prepare(onProgress: ((Int) -> Unit)? = null) {
-        modelDir.mkdirs()
-        if (!isInstalled()) {
-            download(MODEL_URL, File(modelDir, "model.onnx"), onProgress, 100)
-            download(TOKENS_URL, File(modelDir, "tokens.txt"), null, 0)
-        }
-        if (engine == null) {
-            val vits = OfflineTtsVitsModelConfig(
-                model = File(modelDir, "model.onnx").absolutePath,
-                lexicon = "",
-                tokens = File(modelDir, "tokens.txt").absolutePath,
-                dataDir = "",
-                noiseScale = 0.667f,
-                noiseScaleW = 0.8f,
-                lengthScale = 1.0f,
-            )
-            engine = OfflineTts(
-                config = OfflineTtsConfig(
-                    model = OfflineTtsModelConfig(
-                        vits = vits,
-                        numThreads = 2,
-                        provider = "cpu",
+        try {
+            modelDir.mkdirs()
+            if (!isInstalled()) {
+                download(MODEL_URL, File(modelDir, "model.onnx"), onProgress, 100)
+                download(TOKENS_URL, File(modelDir, "tokens.txt"), null, 0)
+            }
+            if (engine == null) {
+                val modelFile = File(modelDir, "model.onnx")
+                val tokensFile = File(modelDir, "tokens.txt")
+                if (!modelFile.exists() || !tokensFile.exists()) {
+                    Log.e(TAG, "Model files missing after download")
+                    return
+                }
+                val vits = OfflineTtsVitsModelConfig(
+                    model = modelFile.absolutePath,
+                    lexicon = "",
+                    tokens = tokensFile.absolutePath,
+                    dataDir = "",
+                    noiseScale = 0.667f,
+                    noiseScaleW = 0.8f,
+                    lengthScale = 1.0f,
+                )
+                val created = OfflineTts(
+                    config = OfflineTtsConfig(
+                        model = OfflineTtsModelConfig(
+                            vits = vits,
+                            numThreads = 2,
+                            provider = "cpu",
+                        )
                     )
                 )
-            )
-            Log.i(TAG, "Offline Persian TTS initialized; sampleRate=${engine!!.sampleRate()}")
+                engine = created
+                Log.i(TAG, "Offline Persian TTS initialized; sampleRate=${created.sampleRate()}")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "prepare failed", e)
+            engine = null
+            throw e
         }
     }
 
     /** Generates and plays speech. Call off the main thread. */
     @Synchronized
     fun speak(text: String) {
-        prepare()
-        val normalizedText = normalizeText(text)
+        try {
+            prepare()
+        } catch (e: Exception) {
+            Log.e(TAG, "prepare inside speak failed", e)
+            return
+        }
+        val eng = engine ?: run {
+            Log.e(TAG, "engine is null; cannot speak")
+            return
+        }
+
+        val normalizedText = try { normalizeText(text) } catch (e: Exception) {
+            Log.e(TAG, "normalizeText failed", e); text
+        }
         Log.d(TAG, "speak raw='$text' normalized='$normalizedText'")
         if (normalizedText.isBlank()) {
             Log.w(TAG, "Normalized text is empty; nothing to speak")
             return
         }
-        val audio = engine!!.generate(text = normalizedText, sid = 0, speed = 1.0f)
+
+        val audio = try {
+            eng.generate(text = normalizedText, sid = 0, speed = 1.0f)
+        } catch (e: Exception) {
+            Log.e(TAG, "engine.generate failed", e); return
+        }
+
         if (audio.samples.isEmpty()) {
             Log.w(TAG, "TTS generated no audio for: $normalizedText")
             return
         }
         val sampleRate = audio.sampleRate
-        val bufferSize = AudioTrack.getMinBufferSize(
-            sampleRate,
-            AudioFormat.CHANNEL_OUT_MONO,
-            AudioFormat.ENCODING_PCM_FLOAT
-        ).coerceAtLeast(audio.samples.size * 4)
-        track?.release()
-        val attributes = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_MEDIA)
-            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-            .build()
-        val format = AudioFormat.Builder()
-            .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
-            .setSampleRate(sampleRate)
-            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-            .build()
-        track = AudioTrack(
-            attributes,
-            format,
-            bufferSize,
-            AudioTrack.MODE_STATIC,
-            AudioManager.AUDIO_SESSION_ID_GENERATE
-        )
-        track!!.write(audio.samples, 0, audio.samples.size, AudioTrack.WRITE_BLOCKING)
-        track!!.play()
-        Log.d(TAG, "Played ${audio.samples.size} samples at $sampleRate Hz")
+        if (sampleRate <= 0) {
+            Log.w(TAG, "Invalid sample rate: $sampleRate")
+            return
+        }
+
+        try {
+            val bufferSize = AudioTrack.getMinBufferSize(
+                sampleRate,
+                AudioFormat.CHANNEL_OUT_MONO,
+                AudioFormat.ENCODING_PCM_FLOAT
+            ).coerceAtLeast(audio.samples.size * 4)
+
+            try { track?.release() } catch (_: Exception) {}
+            track = null
+
+            val attributes = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build()
+            val format = AudioFormat.Builder()
+                .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
+                .setSampleRate(sampleRate)
+                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                .build()
+
+            val newTrack = AudioTrack(
+                attributes,
+                format,
+                bufferSize,
+                AudioTrack.MODE_STATIC,
+                AudioManager.AUDIO_SESSION_ID_GENERATE
+            )
+            track = newTrack
+            newTrack.write(audio.samples, 0, audio.samples.size, AudioTrack.WRITE_BLOCKING)
+            newTrack.play()
+            Log.d(TAG, "Played ${audio.samples.size} samples at $sampleRate Hz")
+        } catch (e: Exception) {
+            Log.e(TAG, "AudioTrack playback failed", e)
+            try { track?.release() } catch (_: Exception) {}
+            track = null
+        }
     }
 
     @Synchronized
     fun release() {
-        track?.release()
+        try { track?.release() } catch (_: Exception) {}
         track = null
-        engine?.release()
+        try { engine?.release() } catch (_: Exception) {}
         engine = null
     }
 
     // ============ پیش‌پردازش متن برای TTS ============
 
-    /**
-     * متن را برای مدل VITS فارسی آماده می‌کند:
-     *  - اعداد لاتین و فارسی → کلمه فارسی
-     *  - علائم خاص (%، :، /، ‌و...) → کلمه یا فاصله
-     *  - کاراکترهای غیرمجاز حذف
-     *  - ی/ك عربی → ی/ک فارسی
-     */
     private fun normalizeText(input: String): String {
         var s = input
-
-        // 1) یکسان‌سازی حروف عربی
         s = s.replace("ي", "ی")
              .replace("ك", "ک")
              .replace("ۀ", "ه")
              .replace("ة", "ه")
-             .replace("\u200c", " ")  // نیم‌فاصله → فاصله ساده
+             .replace("\u200c", " ")
 
-        // 2) تبدیل اعداد فارسی و عربی به لاتین برای پردازش یکسان
         s = convertDigitsToLatin(s)
-
-        // 3) تبدیل اعداد لاتین به کلمه فارسی
         s = replaceNumbersWithWords(s)
 
-        // 4) علائم خاص → کلمه یا حذف
         s = s.replace("%", " درصد ")
              .replace(":", " و ")
-             .replace("؛", " ")
-             .replace(";", " ")
-             .replace("/", " ")
-             .replace("\\", " ")
-             .replace("-", " ")
-             .replace("_", " ")
-             .replace("(", " ")
-             .replace(")", " ")
-             .replace("[", " ")
-             .replace("]", " ")
-             .replace("{", " ")
-             .replace("}", " ")
-             .replace("\"", " ")
-             .replace("'", " ")
-             .replace("«", " ")
-             .replace("»", " ")
+             .replace("؛", " ").replace(";", " ")
+             .replace("/", " ").replace("\\", " ")
+             .replace("-", " ").replace("_", " ")
+             .replace("(", " ").replace(")", " ")
+             .replace("[", " ").replace("]", " ")
+             .replace("{", " ").replace("}", " ")
+             .replace("\"", " ").replace("'", " ")
+             .replace("«", " ").replace("»", " ")
              .replace("=", " ")
-             .replace("+", " و ")
-             .replace("&", " و ")
-             .replace("@", " ")
-             .replace("#", " ")
-             .replace("*", " ")
-             .replace("^", " ")
-             .replace("~", " ")
-             .replace("|", " ")
-             .replace("<", " ")
-             .replace(">", " ")
+             .replace("+", " و ").replace("&", " و ")
+             .replace("@", " ").replace("#", " ")
+             .replace("*", " ").replace("^", " ")
+             .replace("~", " ").replace("|", " ")
+             .replace("<", " ").replace(">", " ")
              .replace("$", " ")
 
-        // 5) نقطه و ویرگول و علامت سؤال → مکث (فاصله)
-        s = s.replace("،", "، ")   // ویرگول فارسی نگه‌داشته شود (در برخی مدل‌ها کار می‌کند)
+        s = s.replace("،", "، ")
              .replace(".", ". ")
              .replace("?", "؟ ")
              .replace("؟", "؟ ")
              .replace("!", "! ")
 
-        // 6) حذف کاراکترهای غیرمجاز (هرچی خارج از حروف فارسی، فاصله و علائم مکث است)
         s = s.replace(Regex("[^\\u0600-\\u06FF\\s\\.,،؟!]"), " ")
-
-        // 7) فاصله‌های اضافه
         s = s.replace(Regex("\\s+"), " ").trim()
-
         return s
     }
 
@@ -198,7 +219,6 @@ class OfflinePersianTts(private val context: Context) {
         return sb.toString()
     }
 
-    /** هر رشته عدد لاتین را با معادل کلمه‌ای فارسی جایگزین می‌کند. */
     private fun replaceNumbersWithWords(input: String): String {
         val regex = Regex("\\d+")
         return regex.replace(input) { match ->
@@ -206,7 +226,6 @@ class OfflinePersianTts(private val context: Context) {
             if (num in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong()) {
                 numberToPersianWords(num.toInt())
             } else {
-                // اعداد خیلی بزرگ را رقم‌به‌رقم بخوان
                 match.value.map { digitToPersianWord(it) }.joinToString(" و ")
             }
         }
@@ -245,14 +264,9 @@ class OfflinePersianTts(private val context: Context) {
             parts.add(if (h == 1) "هزار" else "${numberToPersianWords(h)} هزار")
             n %= 1000
         }
-        if (n >= 100) {
-            parts.add(sadgan[n / 100]); n %= 100
-        }
-        if (n >= 20) {
-            parts.add(dahgan[n / 10]); n %= 10
-        } else if (n >= 10) {
-            parts.add(dahYek[n - 10]); n = 0
-        }
+        if (n >= 100) { parts.add(sadgan[n / 100]); n %= 100 }
+        if (n >= 20) { parts.add(dahgan[n / 10]); n %= 10 }
+        else if (n >= 10) { parts.add(dahYek[n - 10]); n = 0 }
         if (n in 1..9) parts.add(yekan[n])
 
         return parts.joinToString(" و ")
