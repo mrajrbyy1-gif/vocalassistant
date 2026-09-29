@@ -5,6 +5,8 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.view.Gravity
+import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -23,7 +25,14 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
+
+        // Text ساده بدون نیاز به layout XML
+        val tv = TextView(this).apply {
+            text = "دستیار صوتی فعال است.\n\nبگویید: سلام یولداش"
+            textSize = 20f
+            gravity = Gravity.CENTER
+        }
+        setContentView(tv)
 
         requestRuntimePermissions()
         startServiceSafe()
