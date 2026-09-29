@@ -15,14 +15,15 @@
 
     <application
         android:allowBackup="true"
-        android:icon="@android:drawable/ic_btn_speak_now"
         android:label="Vocal Assistant"
         android:supportsRtl="true"
-        android:theme="@android:style/Theme.DeviceDefault.Light">
+        android:theme="@android:style/Theme.DeviceDefault.Light"
+        tools:targetApi="34">
 
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:label="Vocal Assistant">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -37,6 +38,7 @@
         <service
             android:name=".NotificationReaderService"
             android:exported="true"
+            android:label="Vocal Assistant"
             android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
             <intent-filter>
                 <action android:name="android.service.notification.NotificationListenerService" />
