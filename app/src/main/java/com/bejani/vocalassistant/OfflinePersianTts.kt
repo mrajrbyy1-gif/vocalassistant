@@ -13,6 +13,7 @@ import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.Locale
 
 /** Offline Persian neural TTS backed by sherpa-onnx and a VITS ONNX model. */
 class OfflinePersianTts(private val context: Context) {
@@ -64,8 +65,17 @@ class OfflinePersianTts(private val context: Context) {
     @Synchronized
     fun speak(text: String) {
         prepare()
-        val audio = engine!!.generate(text = text, sid = 0, speed = 1.0f)
-        if (audio.samples.isEmpty()) error("TTS generated no audio")
+        val normalizedText = normalizeText(text)
+        Log.d(TAG, "speak raw='$text' normalized='$normalizedText'")
+        if (normalizedText.isBlank()) {
+            Log.w(TAG, "Normalized text is empty; nothing to speak")
+            return
+        }
+        val audio = engine!!.generate(text = normalizedText, sid = 0, speed = 1.0f)
+        if (audio.samples.isEmpty()) {
+            Log.w(TAG, "TTS generated no audio for: $normalizedText")
+            return
+        }
         val sampleRate = audio.sampleRate
         val bufferSize = AudioTrack.getMinBufferSize(
             sampleRate,
@@ -101,6 +111,154 @@ class OfflinePersianTts(private val context: Context) {
         engine?.release()
         engine = null
     }
+
+    // ============ پیش‌پردازش متن برای TTS ============
+
+    /**
+     * متن را برای مدل VITS فارسی آماده می‌کند:
+     *  - اعداد لاتین و فارسی → کلمه فارسی
+     *  - علائم خاص (%، :، /، ‌و...) → کلمه یا فاصله
+     *  - کاراکترهای غیرمجاز حذف
+     *  - ی/ك عربی → ی/ک فارسی
+     */
+    private fun normalizeText(input: String): String {
+        var s = input
+
+        // 1) یکسان‌سازی حروف عربی
+        s = s.replace("ي", "ی")
+             .replace("ك", "ک")
+             .replace("ۀ", "ه")
+             .replace("ة", "ه")
+             .replace("\u200c", " ")  // نیم‌فاصله → فاصله ساده
+
+        // 2) تبدیل اعداد فارسی و عربی به لاتین برای پردازش یکسان
+        s = convertDigitsToLatin(s)
+
+        // 3) تبدیل اعداد لاتین به کلمه فارسی
+        s = replaceNumbersWithWords(s)
+
+        // 4) علائم خاص → کلمه یا حذف
+        s = s.replace("%", " درصد ")
+             .replace(":", " و ")
+             .replace("؛", " ")
+             .replace(";", " ")
+             .replace("/", " ")
+             .replace("\\", " ")
+             .replace("-", " ")
+             .replace("_", " ")
+             .replace("(", " ")
+             .replace(")", " ")
+             .replace("[", " ")
+             .replace("]", " ")
+             .replace("{", " ")
+             .replace("}", " ")
+             .replace("\"", " ")
+             .replace("'", " ")
+             .replace("«", " ")
+             .replace("»", " ")
+             .replace("=", " ")
+             .replace("+", " و ")
+             .replace("&", " و ")
+             .replace("@", " ")
+             .replace("#", " ")
+             .replace("*", " ")
+             .replace("^", " ")
+             .replace("~", " ")
+             .replace("|", " ")
+             .replace("<", " ")
+             .replace(">", " ")
+             .replace("$", " ")
+
+        // 5) نقطه و ویرگول و علامت سؤال → مکث (فاصله)
+        s = s.replace("،", "، ")   // ویرگول فارسی نگه‌داشته شود (در برخی مدل‌ها کار می‌کند)
+             .replace(".", ". ")
+             .replace("?", "؟ ")
+             .replace("؟", "؟ ")
+             .replace("!", "! ")
+
+        // 6) حذف کاراکترهای غیرمجاز (هرچی خارج از حروف فارسی، فاصله و علائم مکث است)
+        s = s.replace(Regex("[^\\u0600-\\u06FF\\s\\.,،؟!]"), " ")
+
+        // 7) فاصله‌های اضافه
+        s = s.replace(Regex("\\s+"), " ").trim()
+
+        return s
+    }
+
+    private fun convertDigitsToLatin(input: String): String {
+        val sb = StringBuilder(input.length)
+        for (ch in input) {
+            val mapped = when (ch) {
+                '۰','٠' -> '0'; '۱','١' -> '1'; '۲','٢' -> '2'; '۳','٣' -> '3'; '۴','٤' -> '4'
+                '۵','٥' -> '5'; '۶','٦' -> '6'; '۷','٧' -> '7'; '۸','٨' -> '8'; '۹','٩' -> '9'
+                else -> ch
+            }
+            sb.append(mapped)
+        }
+        return sb.toString()
+    }
+
+    /** هر رشته عدد لاتین را با معادل کلمه‌ای فارسی جایگزین می‌کند. */
+    private fun replaceNumbersWithWords(input: String): String {
+        val regex = Regex("\\d+")
+        return regex.replace(input) { match ->
+            val num = match.value.toLongOrNull() ?: return@replace match.value
+            if (num in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong()) {
+                numberToPersianWords(num.toInt())
+            } else {
+                // اعداد خیلی بزرگ را رقم‌به‌رقم بخوان
+                match.value.map { digitToPersianWord(it) }.joinToString(" و ")
+            }
+        }
+    }
+
+    private fun digitToPersianWord(ch: Char): String = when (ch) {
+        '0' -> "صفر"; '1' -> "یک"; '2' -> "دو"; '3' -> "سه"; '4' -> "چهار"
+        '5' -> "پنج"; '6' -> "شش"; '7' -> "هفت"; '8' -> "هشت"; '9' -> "نه"
+        else -> ""
+    }
+
+    private fun numberToPersianWords(number: Int): String {
+        if (number == 0) return "صفر"
+        if (number < 0) return "منفی " + numberToPersianWords(-number)
+
+        val yekan = arrayOf("", "یک", "دو", "سه", "چهار", "پنج", "شش", "هفت", "هشت", "نه")
+        val dahgan = arrayOf("", "", "بیست", "سی", "چهل", "پنجاه", "شصت", "هفتاد", "هشتاد", "نود")
+        val dahYek = arrayOf("ده", "یازده", "دوازده", "سیزده", "چهارده", "پانزده", "شانزده", "هفده", "هجده", "نوزده")
+        val sadgan = arrayOf("", "صد", "دویست", "سیصد", "چهارصد", "پانصد", "ششصد", "هفتصد", "هشتصد", "نهصد")
+
+        var n = number
+        val parts = mutableListOf<String>()
+
+        if (n >= 1_000_000_000) {
+            val b = n / 1_000_000_000
+            parts.add(if (b == 1) "یک میلیارد" else "${numberToPersianWords(b)} میلیارد")
+            n %= 1_000_000_000
+        }
+        if (n >= 1_000_000) {
+            val m = n / 1_000_000
+            parts.add(if (m == 1) "یک میلیون" else "${numberToPersianWords(m)} میلیون")
+            n %= 1_000_000
+        }
+        if (n >= 1000) {
+            val h = n / 1000
+            parts.add(if (h == 1) "هزار" else "${numberToPersianWords(h)} هزار")
+            n %= 1000
+        }
+        if (n >= 100) {
+            parts.add(sadgan[n / 100]); n %= 100
+        }
+        if (n >= 20) {
+            parts.add(dahgan[n / 10]); n %= 10
+        } else if (n >= 10) {
+            parts.add(dahYek[n - 10]); n = 0
+        }
+        if (n in 1..9) parts.add(yekan[n])
+
+        return parts.joinToString(" و ")
+    }
+
+    // ============ دانلود مدل ============
 
     private fun download(url: String, destination: File, onProgress: ((Int) -> Unit)?, progressWeight: Int) {
         val temporary = File(destination.parentFile, destination.name + ".part")
