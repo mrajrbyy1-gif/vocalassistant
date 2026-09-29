@@ -2,6 +2,7 @@ package com.bejani.vocalassistant
 
 import android.app.Notification
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
@@ -10,7 +11,7 @@ class NotificationReaderService : NotificationListenerService() {
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         sbn ?: return
-        if (sbn.packageName == packageName) return // اعلان خودمان را نخوان
+        if (sbn.packageName == packageName) return
 
         val extras: Bundle = sbn.notification?.extras ?: return
         val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
@@ -24,7 +25,6 @@ class NotificationReaderService : NotificationListenerService() {
         }
         if (body.isBlank()) return
 
-        // نام برنامه
         val appLabel = try {
             val pm = packageManager
             pm.getApplicationLabel(pm.getApplicationInfo(sbn.packageName, 0)).toString()
@@ -36,6 +36,11 @@ class NotificationReaderService : NotificationListenerService() {
             putExtra(VoiceAssistantService.EXTRA_NOTIF_SENDER, title)
             putExtra(VoiceAssistantService.EXTRA_NOTIF_TEXT, body)
         }
-        startService(intent)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
     }
 }
