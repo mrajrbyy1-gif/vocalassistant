@@ -7,11 +7,14 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ResolveInfo
+import android.content.pm.ServiceInfo
+import android.os.Build
 import android.provider.ContactsContract
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -35,13 +38,13 @@ class VoiceAssistantService : Service() {
     private var pendingPhone: String? = null
     private var pendingName: String? = null
 
-    // برای خواندن اعلان و پیشنهاد خواندن متن
+    // اعلان در انتظار خواندن
     private var pendingNotificationRead = false
     private var pendingNotificationText: String? = null
     private var pendingNotificationApp: String? = null
     private var pendingNotificationSender: String? = null
 
-    private val handler = Handler(android.os.Looper.getMainLooper())
+    private val handler = Handler(Looper.getMainLooper())
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -65,11 +68,23 @@ class VoiceAssistantService : Service() {
         super.onCreate()
         createChannel()
         offlineTts = OfflinePersianTts(this)
-        startForeground(10, notification("در انتظار سلام یولداش"))
+        startForegroundSafely("در انتظار سلام یولداش")
         startListening()
     }
 
-    // ---------------- Speech recognition ----------------
+    private fun startForegroundSafely(text: String) {
+        val notif = notification(text)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                10, notif,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            )
+        } else {
+            startForeground(10, notif)
+        }
+    }
+
+    // ---------------- Speech Recognition ----------------
 
     private fun startListening() {
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
@@ -83,7 +98,9 @@ class VoiceAssistantService : Service() {
                     val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         ?.joinToString(" ")?.lowercase(Locale("fa", "IR")) ?: ""
                     android.util.Log.d("VocalAssistantSTT", "final text=$text")
-                    if (!testMode && text.isNotBlank()) updateNotification("شنیده شد: ${text.take(70)}")
+                    if (!testMode && text.isNotBlank()) {
+                        updateNotification("شنیده شد: ${text.take(70)}")
+                    }
                     if (!testMode) handleText(text)
                     if (!testMode) scheduleRestart()
                 }
@@ -104,13 +121,16 @@ class VoiceAssistantService : Service() {
                 override fun onRmsChanged(rmsdB: Float) {}
                 override fun onBufferReceived(buffer: ByteArray?) {}
                 override fun onEndOfSpeech() {}
+
                 override fun onPartialResults(partialResults: Bundle?) {
-                    val text = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    val text = partialResults
+                        ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         ?.joinToString(" ")?.lowercase(Locale("fa", "IR")) ?: ""
                     if (!testMode && text.isNotBlank()) {
                         updateNotification("در حال تشخیص: ${text.take(60)}")
                     }
                 }
+
                 override fun onEvent(eventType: Int, params: Bundle?) {}
             })
         }
@@ -123,7 +143,12 @@ class VoiceAssistantService : Service() {
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1200L)
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 800L)
         }
-        recognizer?.startListening(intent)
+        try {
+            recognizer?.startListening(intent)
+        } catch (e: Exception) {
+            android.util.Log.e("VocalAssistantSTT", "startListening failed", e)
+            scheduleRestart()
+        }
     }
 
     private fun scheduleRestart() {
@@ -136,7 +161,7 @@ class VoiceAssistantService : Service() {
         }, 400)
     }
 
-    // ---------------- Wake phrase ----------------
+    // ---------------- Wake Phrase ----------------
 
     private fun isWakePhrase(text: String): Boolean {
         val normalized = text.lowercase(Locale("fa", "IR"))
@@ -145,18 +170,19 @@ class VoiceAssistantService : Service() {
             .replace("ك", "ک")
             .replace(Regex("[^a-z0-9آ-ی]"), "")
         return normalized.contains("سلامیولداش") ||
-               normalized.contains("salamyoldas") ||
-               normalized.contains("سلامیولداش")
+               normalized.contains("salamyoldas")
     }
 
-    // ---------------- Main dispatcher ----------------
+    // ---------------- Dispatcher ----------------
 
     private fun handleText(text: String) {
-        android.util.Log.d("VocalAssistantSTT", "handleText=$text; confirmation=$confirmationMode; awaiting=$awaitingCommand; pendingNotif=$pendingNotificationRead")
-
         val normalized = normalizeCommandForMatching(text)
+        android.util.Log.d(
+            "VocalAssistantSTT",
+            "handleText=$normalized; confirmation=$confirmationMode; awaiting=$awaitingCommand; pendingNotif=$pendingNotificationRead"
+        )
 
-        // 0) پاسخ به پیشنهاد خواندن اعلان
+        // پاسخ به پیشنهاد خواندن اعلان
         if (pendingNotificationRead) {
             if (isConfirmation(normalized)) {
                 val body = pendingNotificationText.orEmpty()
@@ -182,11 +208,11 @@ class VoiceAssistantService : Service() {
                 speak("باشه، نمی‌خوانم.")
                 return
             }
-            // اگر چیز دیگری گفت، پیشنهاد را رها کن و ادامه بده
+            // اگر چیز دیگری گفت، پیشنهاد را رها کن
             pendingNotificationRead = false
         }
 
-        // 1) Wake phrase
+        // Wake phrase
         if (isWakePhrase(normalized)) {
             confirmationMode = false
             awaitingCommand = true
@@ -196,19 +222,19 @@ class VoiceAssistantService : Service() {
             return
         }
 
-        // 2) باز کردن برنامه
+        // باز کردن برنامه
         if (!confirmationMode && handleOpenAppCommand(normalized)) {
             awaitingCommand = true
             return
         }
 
-        // 3) اطلاعات (ساعت، تاریخ، باتری)
+        // اطلاعات (ساعت/تاریخ/باتری)
         if (!confirmationMode && handleInfoCommand(normalized)) {
             awaitingCommand = true
             return
         }
 
-        // 4) تماس
+        // تماس
         if (!confirmationMode && isCallCommand(normalized)) {
             awaitingCommand = false
             val contact = findContact(normalized)
@@ -229,7 +255,7 @@ class VoiceAssistantService : Service() {
             return
         }
 
-        // 5) تأیید/لغو تماس
+        // تأیید/رد تماس
         if (confirmationMode && isConfirmation(normalized)) {
             confirmationMode = false
             placeCall()
@@ -246,7 +272,7 @@ class VoiceAssistantService : Service() {
             return
         }
 
-        // 6) دستور ناشناخته
+        // نامفهوم
         if (!confirmationMode && awaitingCommand) {
             awaitingCommand = false
             val prompt = "این فرمان را متوجه نشدم."
@@ -255,28 +281,27 @@ class VoiceAssistantService : Service() {
         }
     }
 
-    // ---------------- Open app ----------------
+    // ---------------- Open App ----------------
 
     private data class LaunchableApp(val label: String, val packageName: String)
 
-    // نام‌های مستعار رایج (کاربر ممکن است بگوید "واتساپ"، بسته نصب‌شده "WhatsApp" باشد)
     private val appAliases: Map<String, List<String>> = mapOf(
-        "whatsapp" to listOf("واتساپ", "واتس اپ", "whatsapp"),
-        "telegram" to listOf("تلگرام", "telegram"),
+        "whatsapp"  to listOf("واتساپ", "واتس اپ", "whatsapp"),
+        "telegram"  to listOf("تلگرام", "telegram"),
         "instagram" to listOf("اینستاگرام", "اینستا", "instagram"),
-        "chrome" to listOf("کروم", "chrome"),
-        "youtube" to listOf("یوتیوب", "youtube"),
-        "camera" to listOf("دوربین", "camera"),
-        "gallery" to listOf("گالری", "گالری تصاویر", "photos", "gallery"),
-        "phone" to listOf("تلفن", "تماس", "phone", "dialer"),
-        "messages" to listOf("پیام", "پیام‌ها", "messages", "sms"),
-        "settings" to listOf("تنظیمات", "settings"),
-        "clock" to listOf("ساعت", "زمان", "clock"),
+        "chrome"    to listOf("کروم", "chrome"),
+        "youtube"   to listOf("یوتیوب", "youtube"),
+        "camera"    to listOf("دوربین", "camera"),
+        "gallery"   to listOf("گالری", "گالری تصاویر", "photos", "gallery"),
+        "phone"     to listOf("تلفن", "phone", "dialer"),
+        "messages"  to listOf("پیام", "پیام‌ها", "messages", "sms"),
+        "settings"  to listOf("تنظیمات", "settings"),
+        "clock"     to listOf("ساعت", "clock"),
         "calculator" to listOf("ماشین حساب", "حساب", "calculator"),
-        "maps" to listOf("نقشه", "گوگل مپ", "maps"),
-        "browser" to listOf("مرورگر", "browser"),
-        "music" to listOf("موسیقی", "آهنگ", "music"),
-        "calendar" to listOf("تقویم", "calendar")
+        "maps"      to listOf("نقشه", "گوگل مپ", "maps"),
+        "browser"   to listOf("مرورگر", "browser"),
+        "music"     to listOf("موسیقی", "آهنگ", "music"),
+        "calendar"  to listOf("تقویم", "calendar")
     )
 
     private fun handleOpenAppCommand(text: String): Boolean {
@@ -329,7 +354,7 @@ class VoiceAssistantService : Service() {
             updateNotification(prompt)
             speak(prompt)
         } catch (error: Exception) {
-            android.util.Log.e("VocalAssistantSTT", "Could not open app ${app.packageName}", error)
+            android.util.Log.e("VocalAssistantSTT", "open app failed", error)
             val prompt = "نتوانستم ${app.label} را باز کنم."
             updateNotification(prompt)
             speak(prompt)
@@ -343,37 +368,34 @@ class VoiceAssistantService : Service() {
         val launcherIntent = Intent(Intent.ACTION_MAIN).apply {
             addCategory(Intent.CATEGORY_LAUNCHER)
         }
-
         val apps = packageManager.queryIntentActivities(
-            launcherIntent,
-            PackageManager.MATCH_ALL
+            launcherIntent, PackageManager.MATCH_ALL
         ).mapNotNull { info: ResolveInfo ->
             val label = info.loadLabel(packageManager)?.toString()?.trim()
-            val packageName = info.activityInfo?.packageName
-            if (label.isNullOrBlank() || packageName.isNullOrBlank()) null
-            else LaunchableApp(label, packageName)
+            val pkg = info.activityInfo?.packageName
+            if (label.isNullOrBlank() || pkg.isNullOrBlank()) null
+            else LaunchableApp(label, pkg)
         }.distinctBy { it.packageName }
 
-        // 1) match مستقیم روی label
+        // 1) نام دقیق
         apps.firstOrNull { normalizeName(it.label) == normalizedQuery }?.let { return it }
 
-        // 2) match با نام‌های مستعار
-        for ((_, aliases) in appAliases) {
+        // 2) با نام‌های مستعار
+        for ((pkgKey, aliases) in appAliases) {
             if (aliases.any { normalizeName(it) == normalizedQuery || normalizedQuery.contains(normalizeName(it)) }) {
-                // دنبال اپی بگرد که label آن شامل یکی از alias‌ها یا کلید انگلیسی باشد
                 val match = apps.firstOrNull { app ->
                     val label = normalizeName(app.label)
                     val pkg = app.packageName.lowercase(Locale.US)
-                    aliases.any { alias ->
-                        val a = normalizeName(alias)
-                        label.contains(a) || pkg.contains(a.replace(" ", ""))
-                    } || pkg.contains(aliases.first().replace(" ", "").lowercase(Locale.US))
+                    aliases.any { a ->
+                        val an = normalizeName(a)
+                        label.contains(an) || pkg.contains(an.replace(" ", ""))
+                    } || pkg.contains(pkgKey)
                 }
                 if (match != null) return match
             }
         }
 
-        // 3) partial label
+        // 3) تطبیق جزئی
         apps.firstOrNull {
             val label = normalizeName(it.label)
             label.contains(normalizedQuery) || normalizedQuery.contains(label)
@@ -386,7 +408,7 @@ class VoiceAssistantService : Service() {
         for (app in apps) {
             val label = normalizeName(app.label)
             val pkg = app.packageName.lowercase(Locale.US)
-            val score = queryTokens.count { token -> label.contains(token) || pkg.contains(token) }
+            val score = queryTokens.count { t -> label.contains(t) || pkg.contains(t) }
             if (score > bestScore) {
                 bestScore = score
                 best = app
@@ -395,7 +417,7 @@ class VoiceAssistantService : Service() {
         return if (bestScore > 0) best else null
     }
 
-    // ---------------- Info: time / date / battery ----------------
+    // ---------------- Info Commands ----------------
 
     private fun handleInfoCommand(text: String): Boolean {
         val command = normalizeCommandForMatching(text)
@@ -454,19 +476,15 @@ class VoiceAssistantService : Service() {
             n %= 1000
         }
         if (n >= 100) {
-            parts.add(sadgan[n / 100])
-            n %= 100
+            parts.add(sadgan[n / 100]); n %= 100
         }
         if (n >= 20) {
-            parts.add(dahgan[n / 10])
-            n %= 10
+            parts.add(dahgan[n / 10]); n %= 10
         } else if (n >= 10) {
-            parts.add(dahYek[n - 10])
-            n = 0
+            parts.add(dahYek[n - 10]); n = 0
         }
-        if (n in 1..9) {
-            parts.add(yekan[n])
-        }
+        if (n in 1..9) parts.add(yekan[n])
+
         return parts.joinToString(" و ")
     }
 
@@ -496,7 +514,10 @@ class VoiceAssistantService : Service() {
     }
 
     private fun speakBatteryLevel() {
-        val batteryIntent = registerReceiver(null, android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val batteryIntent = registerReceiver(
+            null,
+            android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+        )
         if (batteryIntent == null) {
             val answer = "نتوانستم میزان شارژ باتری را بخوانم."
             updateNotification(answer); speak(answer); return
@@ -506,4 +527,243 @@ class VoiceAssistantService : Service() {
         val status = batteryIntent.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1)
         val percent = if (level >= 0 && scale > 0) (level * 100 / scale) else -1
 
-        va
+        val chargingText = when (status) {
+            android.os.BatteryManager.BATTERY_STATUS_CHARGING -> " و در حال شارژ است"
+            android.os.BatteryManager.BATTERY_STATUS_FULL -> " و کاملاً شارژ شده است"
+            else -> ""
+        }
+        val answer = if (percent >= 0)
+            "شارژ باتری ${numberToPersianWords(percent)} درصد است$chargingText."
+        else
+            "نتوانستم میزان شارژ باتری را بخوانم."
+        updateNotification(answer)
+        speak(answer)
+    }
+
+    private fun gregorianToJalali(gyInput: Int, gm: Int, gd: Int): Triple<Int, Int, Int> {
+        val gdm = intArrayOf(0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
+        var gy = gyInput
+        var jy = if (gy > 1600) 979 else 0
+        if (gy > 1600) gy -= 1600 else gy -= 621
+        val gy2 = if (gm > 2) gy + 1 else gy
+        var days = 365 * gy + (gy2 + 3) / 4 - (gy2 + 99) / 100 +
+            (gy2 + 399) / 400 - 80 + gd + gdm[gm - 1]
+        jy += 33 * (days / 12053)
+        days %= 12053
+        jy += 4 * (days / 1461)
+        days %= 1461
+        if (days > 365) {
+            jy += (days - 1) / 365
+            days = (days - 1) % 365
+        }
+        val jm: Int
+        val jd: Int
+        if (days < 186) {
+            jm = 1 + days / 31
+            jd = 1 + days % 31
+        } else {
+            jm = 7 + (days - 186) / 30
+            jd = 1 + (days - 186) % 30
+        }
+        return Triple(jy, jm, jd)
+    }
+
+    // ---------------- Calls ----------------
+
+    private fun isCallCommand(text: String): Boolean = listOf(
+        "تماس", "تماس بگیر", "تماس بزن", "زنگ", "زنگ بزن", "زنگ بگیر", "تلفن"
+    ).any(text::contains)
+
+    private fun findContact(command: String): Pair<String, String>? {
+        val query = command
+            .replace("سلام یولداش", "", ignoreCase = true)
+            .replace("تماس بگیر", "", ignoreCase = true)
+            .replace("تماس بزن", "", ignoreCase = true)
+            .replace("زنگ بزن به", "", ignoreCase = true)
+            .replace("زنگ بزن", "", ignoreCase = true)
+            .replace("زنگ بگیر", "", ignoreCase = true)
+            .replace(Regex("^(به|با)\\s+"), "")
+            .trim()
+        if (query.isBlank()) return null
+
+        val queryNormalized = normalizeName(query)
+        if (queryNormalized.isBlank()) return null
+
+        var best: Pair<String, String>? = null
+        var bestScore = 0
+        contentResolver.query(
+            ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+            arrayOf(
+                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                ContactsContract.CommonDataKinds.Phone.NUMBER
+            ),
+            null, null, null
+        )?.use { cursor ->
+            while (cursor.moveToNext()) {
+                val name = cursor.getString(0) ?: continue
+                val phone = cursor.getString(1) ?: continue
+                val normalizedName = normalizeName(name)
+                if (normalizedName.isBlank()) continue
+                val score = when {
+                    normalizedName == queryNormalized -> 100
+                    normalizedName.contains(queryNormalized) ||
+                        queryNormalized.contains(normalizedName) -> 80
+                    else -> queryNormalized.split(" ")
+                        .filter { it.length > 1 }
+                        .count { t -> normalizedName.contains(t) } * 10
+                }
+                if (score > bestScore) {
+                    bestScore = score
+                    best = name to phone
+                }
+            }
+        }
+        return if (bestScore >= 20) best else null
+    }
+
+    private fun normalizeName(value: String): String = value.lowercase(Locale("fa", "IR"))
+        .replace("ي", "ی")
+        .replace("ك", "ک")
+        .replace("ۀ", "ه")
+        .replace("ة", "ه")
+        .replace("ö", "o").replace("ü", "u")
+        .replace("ş", "s").replace("ç", "c").replace("ğ", "g")
+        .replace(Regex("[^\\p{L}\\p{N} ]"), " ")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+
+    private fun normalizeCommandForMatching(value: String): String = value
+        .replace("ي", "ی")
+        .replace("ك", "ک")
+        .replace("ۀ", "ه")
+        .replace("ة", "ه")
+        .replace("\u200c", " ")
+        .replace("؟", " ")
+        .replace("?", " ")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+        .lowercase(Locale("fa", "IR"))
+
+    private fun isConfirmation(text: String): Boolean = listOf(
+        "تایید", "تأیید", "تایید می کنم", "تأیید می‌کنم",
+        "بله", "آره", "حتما", "حتماً", "بخوان"
+    ).any(text::contains)
+
+    private fun isRejection(text: String): Boolean = listOf(
+        "لغو", "نه", "خیر", "انصراف", "نمی‌خوام", "نمیخوام", "نخوان"
+    ).any(text::contains)
+
+    private fun placeCall() {
+        val phone = pendingPhone
+            ?: getSharedPreferences("assistant", MODE_PRIVATE).getString("phone", null)
+        if (phone.isNullOrBlank()) {
+            updateNotification("مخاطب انتخاب نشده است")
+            return
+        }
+        if (ActivityCompat.checkSelfPermission(
+                this, Manifest.permission.CALL_PHONE
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            updateNotification("مجوز تماس فعال نیست")
+            speak("مجوز تماس فعال نیست")
+            return
+        }
+        val intent = Intent(Intent.ACTION_CALL, Uri.parse("tel:${Uri.encode(phone)}")).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        try {
+            startActivity(intent)
+            updateNotification("در حال برقراری تماس با ${pendingName ?: "مخاطب"}")
+            speak("در حال برقراری تماس")
+            pendingPhone = null
+            pendingName = null
+        } catch (error: SecurityException) {
+            updateNotification("تماس به دلیل مجوز امنیتی انجام نشد")
+            speak("تماس انجام نشد")
+        } catch (error: android.content.ActivityNotFoundException) {
+            updateNotification("برنامه تلفن پیدا نشد")
+            speak("برنامه تلفن پیدا نشد")
+        } catch (error: Exception) {
+            updateNotification("تماس انجام نشد")
+            speak("تماس انجام نشد")
+        }
+    }
+
+    // ---------------- Notifications ----------------
+
+    private fun announceNotification(app: String, sender: String?, body: String) {
+        pendingNotificationApp = app
+        pendingNotificationSender = sender
+        pendingNotificationText = body
+        pendingNotificationRead = true
+
+        val fromText = if (!sender.isNullOrBlank()) "از $sender در $app" else "از $app"
+        val prompt = "یک پیام $fromText رسید. متن پیام را بخوانم؟ بگویید بله یا نه."
+        updateNotification(prompt)
+        speak(prompt)
+    }
+
+    // ---------------- TTS ----------------
+
+    private fun speak(text: String) {
+        pendingSpeech = text
+        if (ttsPreparing) return
+        ttsPreparing = true
+        Thread {
+            try {
+                offlineTts.prepare { progress ->
+                    updateNotification("دانلود مدل صدای فارسی: $progress%")
+                }
+                ttsReady = true
+                val queued = pendingSpeech
+                pendingSpeech = null
+                if (!queued.isNullOrBlank()) offlineTts.speak(queued)
+                updateNotification("دستیار فعال است؛ در انتظار سلام یولداش")
+            } catch (error: Exception) {
+                ttsReady = false
+                updateNotification("خطای صدای آفلاین: ${error.message}")
+                android.util.Log.e("OfflinePersianTts", "Speech failed", error)
+            } finally {
+                ttsPreparing = false
+            }
+        }.start()
+    }
+
+    // ---------------- Foreground Notification ----------------
+
+    private fun notification(text: String): Notification =
+        NotificationCompat.Builder(this, "voice")
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setContentTitle("Vocal Assistant")
+            .setContentText(text)
+            .setOngoing(true)
+            .build()
+
+    private fun updateNotification(text: String) {
+        getSystemService(NotificationManager::class.java).notify(10, notification(text))
+    }
+
+    private fun createChannel() {
+        getSystemService(NotificationManager::class.java).createNotificationChannel(
+            NotificationChannel("voice", "دستیار صوتی", NotificationManager.IMPORTANCE_LOW)
+        )
+    }
+
+    override fun onDestroy() {
+        serviceActive = false
+        recognizer?.destroy()
+        recognizer = null
+        offlineTts.release()
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    companion object {
+        const val ACTION_TEST_TTS = "com.bejani.vocalassistant.TEST_TTS"
+        const val ACTION_ANNOUNCE_NOTIFICATION = "com.bejani.vocalassistant.ANNOUNCE_NOTIFICATION"
+        const val EXTRA_NOTIF_APP = "notif_app"
+        const val EXTRA_NOTIF_SENDER = "notif_sender"
+        const val EXTRA_NOTIF_TEXT = "notif_text"
+    }
+}
